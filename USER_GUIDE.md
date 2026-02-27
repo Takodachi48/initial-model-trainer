@@ -10,7 +10,7 @@ A comprehensive guide for training and deploying herb classification models usin
 
 ### 1. Install Dependencies
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### 2. Prepare Dataset Structure
