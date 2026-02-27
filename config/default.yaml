@@ -1,0 +1,75 @@
+# Model Configuration
+model:
+  student:
+    name: "mobilenetv3_small_100"
+    pretrained: true
+    num_classes: 10  # Update based on your dataset
+    freeze_backbone: true
+    unfreeze_last_blocks: 1
+
+  teacher:
+    name: "efficientnet_b0"
+    pretrained: true
+    num_classes: 10  # Update based on your dataset
+    checkpoint: null  # Set after running train_teacher.py
+    freeze_all: true
+
+# Knowledge Distillation
+distillation:
+  alpha: 0.7  # Weight for hard labels (0-1)
+  temperature: 4.0  # Temperature for soft targets
+
+# Training Configuration
+training:
+  phases:
+    phase1:
+      epochs: 10
+      learning_rate: 0.001
+      freeze_backbone: true
+      weight_decay: 1e-4
+
+    phase2:
+      epochs: 5
+      learning_rate: 0.0001
+      freeze_backbone: false
+      weight_decay: 1e-5
+
+  batch_size: 32
+  num_workers: 4
+  device: "auto"  # auto, cpu, cuda
+
+  # Class imbalance handling
+  class_imbalance:
+    use_class_weights: false  # Use weighted loss for imbalanced classes
+    use_balanced_sampler: false  # Use balanced sampling for training data
+
+  # Checkpointing
+  save_dir: "checkpoints"
+  save_every: 5  # Save every N epochs
+  best_model_metric: "val_accuracy"
+
+# Data Configuration
+data:
+  train_dir: "data/train"  # Update with your path
+  val_dir: "data/val"      # Update with your path
+  test_dir: "data/test"    # Update with your path
+
+  image_size: 224
+  normalize:
+    mean: [0.485, 0.456, 0.406]  # ImageNet stats
+    std: [0.229, 0.224, 0.225]
+
+  augmentations:
+    horizontal_flip: 0.5
+    rotation_degrees: 10
+    color_jitter:
+      brightness: 0.1
+      contrast: 0.1
+      saturation: 0.1
+      hue: 0.05
+
+# Logging
+logging:
+  log_dir: "logs"
+  tensorboard: true
+  print_every: 50  # Print metrics every N batches
