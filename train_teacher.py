@@ -308,8 +308,8 @@ def train_model(config, resume_path=None):
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.AdamW(
             trainable_params,
-            lr=phase_config["learning_rate"],
-            weight_decay=phase_config["weight_decay"],
+            lr=float(phase_config["learning_rate"]),
+            weight_decay=float(phase_config["weight_decay"]),
         )
 
         if resume_path and (not resume_loaded) and os.path.exists(resume_path):

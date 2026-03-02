@@ -3,14 +3,14 @@ model:
   student:
     name: "mobilenetv3_small_100"
     pretrained: true
-    num_classes: 10  # Update based on your dataset
+    num_classes: 1  # Update based on your dataset
     freeze_backbone: true
     unfreeze_last_blocks: 1
 
   teacher:
     name: "efficientnet_b0"
     pretrained: true
-    num_classes: 10  # Update based on your dataset
+    num_classes: 1  # Update based on your dataset
     checkpoint: null  # Set after running train_teacher.py
     freeze_all: true
 
@@ -50,9 +50,9 @@ training:
 
 # Data Configuration
 data:
-  train_dir: "data/train"  # Update with your path
-  val_dir: "data/val"      # Update with your path
-  test_dir: "data/test"    # Update with your path
+  train_dir: "for_training/default/train"  # Update with your path
+  val_dir: "for_training/default/val"      # Update with your path
+  test_dir: "for_training/default/test"    # Update with your path
 
   image_size: 224
   normalize:

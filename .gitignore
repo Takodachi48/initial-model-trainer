@@ -121,6 +121,7 @@ dmypy.json
 # Project specific
 checkpoints/
 logs/
+logs_teacher/
 demo_checkpoints/
 demo_logs/
 custom_checkpoints/

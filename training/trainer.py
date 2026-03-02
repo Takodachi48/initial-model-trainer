@@ -185,8 +185,8 @@ class Trainer:
         # Create optimizer
         optimizer = optim.AdamW(
             trainable_params,
-            lr=learning_rate,
-            weight_decay=weight_decay
+            lr=float(learning_rate),
+            weight_decay=float(weight_decay)
         )
         
         print(f"Phase {phase[-1]}: {len(trainable_params)} trainable parameters")
@@ -266,6 +266,18 @@ class Trainer:
         # Calculate epoch metrics
         epoch_metrics = metrics.get_metrics()
         epoch_time = time.time() - epoch_start_time
+        
+        # Handle empty metrics case
+        if not epoch_metrics:
+            print(f"Warning: No training data processed in epoch {epoch}")
+            return {
+                'total_loss': 0.0,
+                'accuracy': 0.0,
+                'hard_loss': 0.0,
+                'soft_loss': 0.0,
+                'total_samples': 0,
+                'correct_predictions': 0
+            }
         
         # Log epoch metrics
         self.writer.add_scalar('Train/EpochLoss', epoch_metrics['total_loss'], epoch)

@@ -65,8 +65,7 @@ data:
 python train_teacher.py --config config/default.yaml
 
 # Step 2: Train student model with knowledge distillation
-python train.py --config config/default.yaml \
-    --override model.teacher.checkpoint checkpoints_teacher/best_teacher_model.pth
+python train.py --config config/default.yaml --override model.teacher.checkpoint checkpoints_teacher/best_teacher_model.pth
 ```
 
 ### 5. Test Your Model
