@@ -277,6 +277,7 @@ def train_model(config, resume_path=None):
         grad_clip_norm=performance_config.get('grad_clip_norm'),
         use_fused_adamw=performance_config.get('adamw_fused', True)
     )
+    trainer.set_dataset_metadata(datasets['train'])
     
     # Setup class imbalance handling if needed
     if (class_imbalance_config.get('use_class_weights', False) or 

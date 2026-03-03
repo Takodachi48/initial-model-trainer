@@ -190,6 +190,27 @@ def create_class_weights(dataset, device: torch.device):
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
+def extract_label_metadata(dataset):
+    """Extract class mapping metadata for checkpoint export."""
+    class_to_idx = getattr(dataset, "class_to_idx", None)
+    classes = getattr(dataset, "classes", None)
+
+    if isinstance(class_to_idx, dict):
+        label_mapping = {str(k): int(v) for k, v in class_to_idx.items()}
+    else:
+        label_mapping = {}
+
+    if isinstance(classes, list):
+        class_names = [str(name) for name in classes]
+    elif label_mapping:
+        class_names = [name for name, _ in sorted(label_mapping.items(), key=lambda kv: kv[1])]
+    else:
+        class_names = []
+
+    idx_to_class = {idx: name for name, idx in label_mapping.items()}
+    return label_mapping, class_names, idx_to_class
+
+
 def _autocast_ctx(use_amp: bool, amp_dtype: torch.dtype):
     if use_amp:
         return torch.cuda.amp.autocast(dtype=amp_dtype)
@@ -285,7 +306,17 @@ def evaluate(
     }
 
 
-def save_checkpoint(save_dir, model, optimizer, epoch, metrics, phase, is_best):
+def save_checkpoint(
+    save_dir,
+    model,
+    optimizer,
+    epoch,
+    metrics,
+    phase,
+    is_best,
+    label_mapping=None,
+    class_names=None,
+):
     checkpoint = {
         "epoch": epoch,
         "teacher_model_state_dict": model.state_dict(),
@@ -293,6 +324,9 @@ def save_checkpoint(save_dir, model, optimizer, epoch, metrics, phase, is_best):
         "metrics": metrics,
         "phase": phase,
         "model_info": model.get_model_info(),
+        "label_mapping": label_mapping or {},
+        "class_names": class_names or [],
+        "idx_to_class": {idx: name for name, idx in (label_mapping or {}).items()},
     }
 
     epoch_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch}_phase_{phase}.pth")
@@ -396,6 +430,7 @@ def train_model(config, resume_path=None):
     if use_balanced_sampler:
         sampler = create_balanced_sampler(datasets["train"])
         data_loaders, datasets = create_data_loaders_from_config(config, balanced_sampler=sampler)
+    label_mapping, class_names, _ = extract_label_metadata(datasets["train"])
 
     class_weights = create_class_weights(datasets["train"], device) if use_class_weights else None
 
@@ -489,6 +524,8 @@ def train_model(config, resume_path=None):
                     metrics=combined,
                     phase=phase_name,
                     is_best=is_best,
+                    label_mapping=label_mapping,
+                    class_names=class_names,
                 )
 
             print(

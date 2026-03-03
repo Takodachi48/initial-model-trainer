@@ -72,6 +72,8 @@ class Trainer:
         self.current_epoch = 0
         self.best_val_accuracy = 0.0
         self.training_phase = "phase1"
+        self.label_mapping = {}
+        self.class_names = []
 
     def _autocast_ctx(self):
         """Build AMP context manager for CUDA, else a no-op context."""
@@ -363,7 +365,10 @@ class Trainer:
             'metrics': metrics,
             'phase': phase,
             'model_info': self.student_model.get_model_info(),
-            'distillation_config': self.distillation_loss.get_loss_info()
+            'distillation_config': self.distillation_loss.get_loss_info(),
+            'label_mapping': self.label_mapping,
+            'class_names': self.class_names,
+            'idx_to_class': {idx: name for name, idx in self.label_mapping.items()}
         }
         
         # Save regular checkpoint
@@ -389,6 +394,8 @@ class Trainer:
         self.student_model.load_state_dict(checkpoint['student_model_state_dict'])
         self.current_epoch = checkpoint['epoch']
         self.training_phase = checkpoint.get('phase', 'phase1')
+        self.label_mapping = checkpoint.get('label_mapping', self.label_mapping)
+        self.class_names = checkpoint.get('class_names', self.class_names)
         
         print(f"Loaded checkpoint from epoch {checkpoint['epoch']} ({self.training_phase})")
         return checkpoint
@@ -416,3 +423,24 @@ Training Summary:
         """
         
         return summary.strip()
+
+    def set_dataset_metadata(self, dataset) -> None:
+        """Store dataset label mapping metadata for checkpoint export."""
+        mapping = getattr(dataset, 'class_to_idx', None)
+        classes = getattr(dataset, 'classes', None)
+
+        if isinstance(mapping, dict):
+            # Keep string keys for stable YAML/JSON interoperability.
+            self.label_mapping = {str(k): int(v) for k, v in mapping.items()}
+        else:
+            self.label_mapping = {}
+
+        if isinstance(classes, list):
+            self.class_names = [str(name) for name in classes]
+        elif self.label_mapping:
+            # Derive class names ordered by class index.
+            self.class_names = [
+                name for name, _ in sorted(self.label_mapping.items(), key=lambda kv: kv[1])
+            ]
+        else:
+            self.class_names = []
