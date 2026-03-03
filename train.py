@@ -29,6 +29,22 @@ from training import Trainer, Validator
 from utils import load_config, get_device, clear_gpu_cache
 
 
+def maybe_compile_model(model, enabled: bool, mode: str, label: str):
+    """Compile model when requested, with safe fallback on unsupported options."""
+    if not enabled or not hasattr(torch, "compile"):
+        return model
+    try:
+        print(f"Compiling {label} model (mode={mode})...")
+        return torch.compile(model, mode=mode)
+    except (TypeError, ValueError) as e:
+        print(f"Compile mode '{mode}' unsupported for {label}; retrying default mode. ({e})")
+        try:
+            return torch.compile(model)
+        except Exception as inner_e:
+            print(f"Compilation skipped for {label}: {inner_e}")
+            return model
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Train CNN model with knowledge distillation")
@@ -143,6 +159,7 @@ def create_data_loaders_from_config(config):
     
     data_config = config.data
     training_config = config.training
+    performance_config = training_config.get('performance', {})
     
     # Create data loaders
     data_loaders, datasets = create_data_loaders(
@@ -154,7 +171,11 @@ def create_data_loaders_from_config(config):
         image_size=data_config.get('image_size', 224),
         normalize_mean=data_config.get('normalize', {}).get('mean'),
         normalize_std=data_config.get('normalize', {}).get('std'),
-        augmentations=data_config.get('augmentations', {})
+        augmentations=data_config.get('augmentations', {}),
+        pin_memory=performance_config.get('pin_memory', True),
+        persistent_workers=performance_config.get('persistent_workers'),
+        prefetch_factor=performance_config.get('prefetch_factor'),
+        drop_last_train=performance_config.get('drop_last_train', True)
     )
     
     # Print dataset info
@@ -205,11 +226,32 @@ def train_model(config, resume_path=None):
     
     # Setup device
     device = get_device(config.training.get('device', 'auto'))
+    performance_config = config.training.get('performance', {})
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = performance_config.get('cudnn_benchmark', True)
+        torch.backends.cuda.matmul.allow_tf32 = performance_config.get('allow_tf32', True)
+        torch.backends.cudnn.allow_tf32 = performance_config.get('allow_tf32', True)
+        torch.set_float32_matmul_precision(performance_config.get('float32_matmul_precision', 'high'))
     
     # Create models
     student_model, teacher_model = create_models(config)
     teacher_checkpoint = config.model.get('teacher', {}).get('checkpoint')
     load_teacher_checkpoint(teacher_model, teacher_checkpoint, device)
+
+    compile_mode = performance_config.get('compile_mode', 'default')
+    student_model = maybe_compile_model(
+        student_model,
+        enabled=performance_config.get('compile_student', False),
+        mode=compile_mode,
+        label='student'
+    )
+    teacher_model = maybe_compile_model(
+        teacher_model,
+        enabled=performance_config.get('compile_teacher', False),
+        mode=compile_mode,
+        label='teacher'
+    )
     
     # Create distillation loss
     distillation_loss = create_distillation_loss(config)
@@ -228,7 +270,12 @@ def train_model(config, resume_path=None):
         log_dir=config.logging.get('log_dir', 'logs'),
         save_dir=config.training.get('save_dir', 'checkpoints'),
         use_class_weights=class_imbalance_config.get('use_class_weights', False),
-        use_balanced_sampler=class_imbalance_config.get('use_balanced_sampler', False)
+        use_balanced_sampler=class_imbalance_config.get('use_balanced_sampler', False),
+        use_amp=performance_config.get('use_amp', True),
+        amp_dtype=performance_config.get('amp_dtype', 'float16'),
+        channels_last=performance_config.get('channels_last', True),
+        grad_clip_norm=performance_config.get('grad_clip_norm'),
+        use_fused_adamw=performance_config.get('adamw_fused', True)
     )
     
     # Setup class imbalance handling if needed
@@ -248,7 +295,11 @@ def train_model(config, resume_path=None):
                 normalize_mean=config.data.get('normalize', {}).get('mean'),
                 normalize_std=config.data.get('normalize', {}).get('std'),
                 augmentations=config.data.get('augmentations', {}),
-                balanced_sampler=trainer.balanced_sampler
+                balanced_sampler=trainer.balanced_sampler,
+                pin_memory=performance_config.get('pin_memory', True),
+                persistent_workers=performance_config.get('persistent_workers'),
+                prefetch_factor=performance_config.get('prefetch_factor'),
+                drop_last_train=performance_config.get('drop_last_train', True)
             )
     
     validator = Validator(
@@ -256,7 +307,10 @@ def train_model(config, resume_path=None):
         teacher_model=teacher_model,
         distillation_loss=distillation_loss,
         device=device,
-        writer=trainer.writer
+        writer=trainer.writer,
+        use_amp=performance_config.get('use_amp', True),
+        amp_dtype=performance_config.get('amp_dtype', 'float16'),
+        channels_last=performance_config.get('channels_last', True)
     )
     
     # Print training summary
@@ -289,6 +343,8 @@ def train_model(config, resume_path=None):
         # Train for specified epochs
         phase_epochs = phase_config['epochs']
         save_every = config.training.get('save_every', 5)
+        standalone_val_every = int(performance_config.get('standalone_val_every', 1))
+        run_standalone_val = standalone_val_every > 0
         
         for epoch in range(start_epoch, start_epoch + phase_epochs):
             print(f"\nEpoch {epoch} ({phase_name})")
@@ -299,14 +355,23 @@ def train_model(config, resume_path=None):
                 train_loader=data_loaders['train'],
                 optimizer=optimizer,
                 epoch=epoch,
-                print_every=config.logging.get('print_every', 50)
+                print_every=config.logging.get('print_every', 50),
+                log_every=performance_config.get('batch_log_every', config.logging.get('print_every', 50))
             )
             
             # Validation
-            with_teacher_metrics, standalone_metrics = validator.validate_comprehensive(
-                val_loader=data_loaders['val'],
-                epoch=epoch
-            )
+            if run_standalone_val and (epoch % standalone_val_every == 0):
+                with_teacher_metrics, standalone_metrics = validator.validate_comprehensive(
+                    val_loader=data_loaders['val'],
+                    epoch=epoch
+                )
+            else:
+                with_teacher_metrics = validator.validate_epoch(
+                    val_loader=data_loaders['val'],
+                    epoch=epoch,
+                    use_teacher=True
+                )
+                standalone_metrics = {'accuracy': 0.0}
             
             # Combine metrics for checkpointing
             combined_metrics = {
@@ -332,7 +397,7 @@ def train_model(config, resume_path=None):
                 )
             
             # Clear GPU cache
-            if device.type == 'cuda':
+            if device.type == 'cuda' and performance_config.get('empty_cache_each_epoch', False):
                 clear_gpu_cache()
         
         # Update start_epoch for next phase
@@ -401,6 +466,12 @@ def test_model_only(config):
     
     # Setup device
     device = get_device(config.training.get('device', 'auto'))
+    performance_config = config.training.get('performance', {})
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = performance_config.get('cudnn_benchmark', True)
+        torch.backends.cuda.matmul.allow_tf32 = performance_config.get('allow_tf32', True)
+        torch.backends.cudnn.allow_tf32 = performance_config.get('allow_tf32', True)
+        torch.set_float32_matmul_precision(performance_config.get('float32_matmul_precision', 'high'))
     
     # Load models
     student_model, teacher_model = create_models(config)
@@ -424,7 +495,10 @@ def test_model_only(config):
         student_model=student_model,
         teacher_model=teacher_model,
         distillation_loss=distillation_loss,
-        device=device
+        device=device,
+        use_amp=performance_config.get('use_amp', True),
+        amp_dtype=performance_config.get('amp_dtype', 'float16'),
+        channels_last=performance_config.get('channels_last', True)
     )
     
     # Run evaluation

@@ -37,6 +37,25 @@ training:
   batch_size: 32
   num_workers: 4
   device: "auto"  # auto, cpu, cuda
+  performance:
+    use_amp: true
+    amp_dtype: "float16"  # float16 or bfloat16
+    channels_last: true
+    compile_student: false
+    compile_teacher: false
+    compile_mode: "default"  # default, reduce-overhead, max-autotune
+    adamw_fused: true
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    drop_last_train: true
+    cudnn_benchmark: true
+    allow_tf32: true
+    float32_matmul_precision: "high"  # highest, high, medium
+    grad_clip_norm: null
+    batch_log_every: 50
+    standalone_val_every: 1  # 1=every epoch, 2=every other, 0=disable standalone pass
+    empty_cache_each_epoch: false
 
   # Class imbalance handling
   class_imbalance:

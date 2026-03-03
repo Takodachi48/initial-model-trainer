@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 import time
+from contextlib import nullcontext
 from typing import Dict, Tuple
 from tqdm import tqdm
 
@@ -21,13 +22,24 @@ class Validator:
         teacher_model: TeacherModel,
         distillation_loss: DistillationLoss,
         device: torch.device,
-        writer: SummaryWriter = None
+        writer: SummaryWriter = None,
+        use_amp: bool = True,
+        amp_dtype: str = "float16",
+        channels_last: bool = True
     ):
         self.student_model = student_model.to(device)
         self.teacher_model = teacher_model.to(device)
         self.distillation_loss = distillation_loss.to(device)
         self.device = device
         self.writer = writer
+        self.use_amp = bool(use_amp and device.type == "cuda")
+        self.channels_last = bool(channels_last and device.type == "cuda")
+        self._amp_dtype = torch.float16 if str(amp_dtype).lower() == "float16" else torch.bfloat16
+
+    def _autocast_ctx(self):
+        if self.use_amp:
+            return torch.cuda.amp.autocast(dtype=self._amp_dtype)
+        return nullcontext()
     
     def validate_epoch(
         self,
@@ -55,24 +67,28 @@ class Validator:
         # Progress bar
         pbar = tqdm(val_loader, desc=f"Validation Epoch {epoch}")
         
-        with torch.no_grad():
+        hard_loss_fn = nn.CrossEntropyLoss()
+        with torch.inference_mode():
             for images, labels in pbar:
                 # Move to device
-                images = images.to(self.device)
-                labels = labels.to(self.device)
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                if self.channels_last and images.dim() == 4:
+                    images = images.contiguous(memory_format=torch.channels_last)
                 
                 # Forward pass
-                student_logits = self.student_model(images)
+                with self._autocast_ctx():
+                    student_logits = self.student_model(images)
                 
                 if use_teacher:
                     # Calculate distillation loss
-                    teacher_logits = self.teacher_model(images)
-                    total_loss, loss_dict = self.distillation_loss(
-                        student_logits, teacher_logits, labels
-                    )
+                    with self._autocast_ctx():
+                        teacher_logits = self.teacher_model(images)
+                        total_loss, loss_dict = self.distillation_loss(
+                            student_logits, teacher_logits, labels
+                        )
                 else:
                     # Calculate only hard loss (student standalone performance)
-                    hard_loss_fn = nn.CrossEntropyLoss()
                     total_loss = hard_loss_fn(student_logits, labels)
                     loss_dict = {
                         'total_loss': total_loss.item(),
@@ -172,17 +188,20 @@ class Validator:
         class_correct = [0] * self.student_model.num_classes
         class_total = [0] * self.student_model.num_classes
         
-        with torch.no_grad():
+        hard_loss_fn = nn.CrossEntropyLoss()
+        with torch.inference_mode():
             for images, labels in tqdm(test_loader, desc=f"Testing {model_name}"):
                 # Move to device
-                images = images.to(self.device)
-                labels = labels.to(self.device)
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                if self.channels_last and images.dim() == 4:
+                    images = images.contiguous(memory_format=torch.channels_last)
                 
                 # Forward pass
-                logits = self.student_model(images)
+                with self._autocast_ctx():
+                    logits = self.student_model(images)
                 
                 # Calculate loss (hard loss only for final evaluation)
-                hard_loss_fn = nn.CrossEntropyLoss()
                 total_loss = hard_loss_fn(logits, labels)
                 loss_dict = {
                     'total_loss': total_loss.item(),
@@ -248,24 +267,30 @@ class Validator:
         self.student_model.eval()
         
         # Warm up
-        with torch.no_grad():
+        with torch.inference_mode():
             for i, (images, _) in enumerate(sample_loader):
                 if i >= 2:  # Warm up with 2 batches
                     break
-                images = images.to(self.device)
-                _ = self.student_model(images)
+                images = images.to(self.device, non_blocking=True)
+                if self.channels_last and images.dim() == 4:
+                    images = images.contiguous(memory_format=torch.channels_last)
+                with self._autocast_ctx():
+                    _ = self.student_model(images)
         
         # Time inference
         torch.cuda.synchronize() if self.device.type == 'cuda' else None
         start_time = time.time()
         
         total_samples = 0
-        with torch.no_grad():
+        with torch.inference_mode():
             for i, (images, _) in enumerate(sample_loader):
                 if i >= num_batches:
                     break
-                images = images.to(self.device)
-                _ = self.student_model(images)
+                images = images.to(self.device, non_blocking=True)
+                if self.channels_last and images.dim() == 4:
+                    images = images.contiguous(memory_format=torch.channels_last)
+                with self._autocast_ctx():
+                    _ = self.student_model(images)
                 total_samples += images.size(0)
         
         torch.cuda.synchronize() if self.device.type == 'cuda' else None

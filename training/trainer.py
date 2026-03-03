@@ -6,6 +6,7 @@ from torch.utils.data import WeightedRandomSampler
 import os
 import time
 import numpy as np
+from contextlib import nullcontext
 from typing import Dict, Tuple, Optional
 from tqdm import tqdm
 from sklearn.utils.class_weight import compute_class_weight
@@ -30,12 +31,29 @@ class Trainer:
         log_dir: str = "logs",
         save_dir: str = "checkpoints",
         use_class_weights: bool = False,
-        use_balanced_sampler: bool = False
+        use_balanced_sampler: bool = False,
+        use_amp: bool = True,
+        amp_dtype: str = "float16",
+        channels_last: bool = True,
+        grad_clip_norm: Optional[float] = None,
+        use_fused_adamw: bool = True
     ):
         self.student_model = student_model.to(device)
         self.teacher_model = teacher_model.to(device)
         self.distillation_loss = distillation_loss.to(device)
         self.device = device
+
+        # Performance options
+        self.use_amp = bool(use_amp and device.type == "cuda")
+        self.channels_last = bool(channels_last and device.type == "cuda")
+        self._amp_dtype = torch.float16 if str(amp_dtype).lower() == "float16" else torch.bfloat16
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.grad_clip_norm = grad_clip_norm
+        self.use_fused_adamw = bool(use_fused_adamw and device.type == "cuda")
+
+        if self.channels_last:
+            self.student_model = self.student_model.to(memory_format=torch.channels_last)
+            self.teacher_model = self.teacher_model.to(memory_format=torch.channels_last)
         
         # Class imbalance handling
         self.use_class_weights = use_class_weights
@@ -54,6 +72,12 @@ class Trainer:
         self.current_epoch = 0
         self.best_val_accuracy = 0.0
         self.training_phase = "phase1"
+
+    def _autocast_ctx(self):
+        """Build AMP context manager for CUDA, else a no-op context."""
+        if self.use_amp:
+            return torch.cuda.amp.autocast(dtype=self._amp_dtype)
+        return nullcontext()
     
     def calculate_class_weights(self, dataset) -> torch.Tensor:
         """
@@ -183,11 +207,19 @@ class Trainer:
         trainable_params = [p for p in self.student_model.parameters() if p.requires_grad]
         
         # Create optimizer
-        optimizer = optim.AdamW(
-            trainable_params,
-            lr=float(learning_rate),
-            weight_decay=float(weight_decay)
-        )
+        adamw_kwargs = {
+            'lr': float(learning_rate),
+            'weight_decay': float(weight_decay)
+        }
+        if self.use_fused_adamw:
+            adamw_kwargs['fused'] = True
+
+        try:
+            optimizer = optim.AdamW(trainable_params, **adamw_kwargs)
+        except TypeError:
+            # Older PyTorch builds may not support fused AdamW.
+            adamw_kwargs.pop('fused', None)
+            optimizer = optim.AdamW(trainable_params, **adamw_kwargs)
         
         print(f"Phase {phase[-1]}: {len(trainable_params)} trainable parameters")
         print(f"Learning rate: {learning_rate}, Weight decay: {weight_decay}")
@@ -199,7 +231,8 @@ class Trainer:
         train_loader,
         optimizer: optim.Optimizer,
         epoch: int,
-        print_every: int = 50
+        print_every: int = 50,
+        log_every: int = 50
     ) -> Dict[str, float]:
         """
         Train for one epoch.
@@ -224,26 +257,46 @@ class Trainer:
         
         for batch_idx, (images, labels) in enumerate(pbar):
             # Move to device
-            images = images.to(self.device)
-            labels = labels.to(self.device)
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+            if self.channels_last and images.dim() == 4:
+                images = images.contiguous(memory_format=torch.channels_last)
             
             # Zero gradients
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
             # Forward pass
-            with torch.no_grad():
-                teacher_logits = self.teacher_model(images)
-            
-            student_logits = self.student_model(images)
-            
-            # Calculate loss
-            total_loss, loss_dict = self.distillation_loss(
-                student_logits, teacher_logits, labels
-            )
-            
+            with torch.inference_mode():
+                with self._autocast_ctx():
+                    teacher_logits = self.teacher_model(images)
+
+            with self._autocast_ctx():
+                student_logits = self.student_model(images)
+
+                # Calculate loss
+                total_loss, loss_dict = self.distillation_loss(
+                    student_logits, teacher_logits, labels
+                )
+
             # Backward pass
-            total_loss.backward()
-            optimizer.step()
+            if self.use_amp:
+                self.scaler.scale(total_loss).backward()
+                if self.grad_clip_norm is not None:
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.student_model.parameters(),
+                        max_norm=float(self.grad_clip_norm)
+                    )
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                total_loss.backward()
+                if self.grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.student_model.parameters(),
+                        max_norm=float(self.grad_clip_norm)
+                    )
+                optimizer.step()
             
             # Update metrics
             batch_size = images.size(0)
@@ -259,9 +312,13 @@ class Trainer:
             
             # Log to tensorboard
             global_step = epoch * len(train_loader) + batch_idx
-            self.writer.add_scalar('Train/BatchLoss', loss_dict['total_loss'], global_step)
-            self.writer.add_scalar('Train/BatchAccuracy', 
-                                  metrics.get_metrics().get('accuracy', 0), global_step)
+            if batch_idx % max(log_every, 1) == 0:
+                self.writer.add_scalar('Train/BatchLoss', loss_dict['total_loss'], global_step)
+                self.writer.add_scalar(
+                    'Train/BatchAccuracy',
+                    metrics.get_metrics().get('accuracy', 0),
+                    global_step
+                )
         
         # Calculate epoch metrics
         epoch_metrics = metrics.get_metrics()

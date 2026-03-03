@@ -12,6 +12,7 @@ import argparse
 import os
 import sys
 import time
+from contextlib import nullcontext
 from typing import Dict
 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -28,6 +29,22 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from models import TeacherModel
 from data import create_data_loaders
 from utils import load_config, get_device, clear_gpu_cache
+
+
+def maybe_compile_model(model, enabled: bool, mode: str, label: str):
+    """Compile model when requested, with safe fallback on unsupported options."""
+    if not enabled or not hasattr(torch, "compile"):
+        return model
+    try:
+        print(f"Compiling {label} model (mode={mode})...")
+        return torch.compile(model, mode=mode)
+    except (TypeError, ValueError) as e:
+        print(f"Compile mode '{mode}' unsupported for {label}; retrying default mode. ({e})")
+        try:
+            return torch.compile(model)
+        except Exception as inner_e:
+            print(f"Compilation skipped for {label}: {inner_e}")
+            return model
 
 
 def get_teacher_save_dir(config) -> str:
@@ -81,6 +98,7 @@ def apply_config_overrides(config, overrides):
 def create_data_loaders_from_config(config, balanced_sampler=None):
     data_config = config.data
     training_config = config.training
+    performance_config = training_config.get("performance", {})
 
     data_loaders, datasets = create_data_loaders(
         train_dir=data_config["train_dir"],
@@ -93,6 +111,10 @@ def create_data_loaders_from_config(config, balanced_sampler=None):
         normalize_std=data_config.get("normalize", {}).get("std"),
         augmentations=data_config.get("augmentations", {}),
         balanced_sampler=balanced_sampler,
+        pin_memory=performance_config.get("pin_memory", True),
+        persistent_workers=performance_config.get("persistent_workers"),
+        prefetch_factor=performance_config.get("prefetch_factor"),
+        drop_last_train=performance_config.get("drop_last_train", True),
     )
 
     for split, dataset in datasets.items():
@@ -168,21 +190,53 @@ def create_class_weights(dataset, device: torch.device):
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
-def run_epoch(model, loader, criterion, optimizer, device, desc: str):
+def _autocast_ctx(use_amp: bool, amp_dtype: torch.dtype):
+    if use_amp:
+        return torch.cuda.amp.autocast(dtype=amp_dtype)
+    return nullcontext()
+
+
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    desc: str,
+    use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.float16,
+    scaler=None,
+    channels_last: bool = True,
+    grad_clip_norm=None
+):
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
 
     for images, labels in tqdm(loader, desc=desc):
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        if channels_last and images.dim() == 4:
+            images = images.contiguous(memory_format=torch.channels_last)
 
-        optimizer.zero_grad()
-        logits = model(images)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        with _autocast_ctx(use_amp, amp_dtype):
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            if grad_clip_norm is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
+            optimizer.step()
 
         running_loss += loss.item()
         preds = torch.argmax(logits, dim=1)
@@ -196,17 +250,29 @@ def run_epoch(model, loader, criterion, optimizer, device, desc: str):
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, desc: str):
+def evaluate(
+    model,
+    loader,
+    criterion,
+    device,
+    desc: str,
+    use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.float16,
+    channels_last: bool = True
+):
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
 
     for images, labels in tqdm(loader, desc=desc):
-        images = images.to(device)
-        labels = labels.to(device)
-        logits = model(images)
-        loss = criterion(logits, labels)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        if channels_last and images.dim() == 4:
+            images = images.contiguous(memory_format=torch.channels_last)
+        with _autocast_ctx(use_amp, amp_dtype):
+            logits = model(images)
+            loss = criterion(logits, labels)
 
         running_loss += loss.item()
         preds = torch.argmax(logits, dim=1)
@@ -257,7 +323,19 @@ def test_data_loading(config):
 def test_model_only(config):
     print("Testing trained teacher model...")
     device = get_device(config.training.get("device", "auto"))
+    performance_config = config.training.get("performance", {})
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = performance_config.get("cudnn_benchmark", True)
+        torch.backends.cuda.matmul.allow_tf32 = performance_config.get("allow_tf32", True)
+        torch.backends.cudnn.allow_tf32 = performance_config.get("allow_tf32", True)
+        torch.set_float32_matmul_precision(performance_config.get("float32_matmul_precision", "high"))
+
     model = create_teacher_model(config).to(device)
+    use_amp = bool(performance_config.get("use_amp", True) and device.type == "cuda")
+    amp_dtype = torch.float16 if str(performance_config.get("amp_dtype", "float16")).lower() == "float16" else torch.bfloat16
+    channels_last = bool(performance_config.get("channels_last", True) and device.type == "cuda")
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
 
     save_dir = get_teacher_save_dir(config)
     checkpoint_path = os.path.join(save_dir, "best_teacher_model.pth")
@@ -270,14 +348,44 @@ def test_model_only(config):
     data_loaders, _ = create_data_loaders_from_config(config)
     criterion = nn.CrossEntropyLoss()
     eval_loader = data_loaders.get("test") or data_loaders["val"]
-    metrics = evaluate(model, eval_loader, criterion, device, "Teacher Evaluation")
+    metrics = evaluate(
+        model,
+        eval_loader,
+        criterion,
+        device,
+        "Teacher Evaluation",
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        channels_last=channels_last,
+    )
     print(f"Teacher accuracy: {metrics['accuracy']:.4f}, loss: {metrics['loss']:.4f}")
 
 
 def train_model(config, resume_path=None):
     print("Starting teacher training...")
     device = get_device(config.training.get("device", "auto"))
+    performance_config = config.training.get("performance", {})
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = performance_config.get("cudnn_benchmark", True)
+        torch.backends.cuda.matmul.allow_tf32 = performance_config.get("allow_tf32", True)
+        torch.backends.cudnn.allow_tf32 = performance_config.get("allow_tf32", True)
+        torch.set_float32_matmul_precision(performance_config.get("float32_matmul_precision", "high"))
+
     model = create_teacher_model(config).to(device)
+    use_amp = bool(performance_config.get("use_amp", True) and device.type == "cuda")
+    amp_dtype = torch.float16 if str(performance_config.get("amp_dtype", "float16")).lower() == "float16" else torch.bfloat16
+    channels_last = bool(performance_config.get("channels_last", True) and device.type == "cuda")
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    compile_mode = performance_config.get("compile_mode", "default")
+    model = maybe_compile_model(
+        model,
+        enabled=performance_config.get("compile_teacher", False),
+        mode=compile_mode,
+        label="teacher",
+    )
 
     # Optional class imbalance handling
     class_imbalance = config.training.get("class_imbalance", {})
@@ -306,11 +414,17 @@ def train_model(config, resume_path=None):
         freeze_backbone = phase_config.get("freeze_backbone", False)
         set_teacher_trainable(model, freeze_backbone=freeze_backbone)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = optim.AdamW(
-            trainable_params,
-            lr=float(phase_config["learning_rate"]),
-            weight_decay=float(phase_config["weight_decay"]),
-        )
+        adamw_kwargs = {
+            "lr": float(phase_config["learning_rate"]),
+            "weight_decay": float(phase_config["weight_decay"]),
+        }
+        if device.type == "cuda" and performance_config.get("adamw_fused", True):
+            adamw_kwargs["fused"] = True
+        try:
+            optimizer = optim.AdamW(trainable_params, **adamw_kwargs)
+        except TypeError:
+            adamw_kwargs.pop("fused", None)
+            optimizer = optim.AdamW(trainable_params, **adamw_kwargs)
 
         if resume_path and (not resume_loaded) and os.path.exists(resume_path):
             checkpoint = load_checkpoint(model, optimizer, resume_path, device)
@@ -332,6 +446,11 @@ def train_model(config, resume_path=None):
                 optimizer=optimizer,
                 device=device,
                 desc=f"Epoch {epoch} [{phase_name}] Train",
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                scaler=scaler,
+                channels_last=channels_last,
+                grad_clip_norm=performance_config.get("grad_clip_norm"),
             )
             val_metrics = evaluate(
                 model=model,
@@ -339,6 +458,9 @@ def train_model(config, resume_path=None):
                 criterion=criterion,
                 device=device,
                 desc=f"Epoch {epoch} [{phase_name}] Val",
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                channels_last=channels_last,
             )
 
             combined = {
@@ -375,7 +497,7 @@ def train_model(config, resume_path=None):
                 f"val_acc={combined['val_accuracy']:.4f}"
             )
 
-            if device.type == "cuda":
+            if device.type == "cuda" and performance_config.get("empty_cache_each_epoch", False):
                 clear_gpu_cache()
 
         start_epoch += phase_epochs
@@ -392,6 +514,9 @@ def train_model(config, resume_path=None):
             criterion=nn.CrossEntropyLoss(),
             device=device,
             desc="Teacher Final Test",
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
         )
         print(f"Final teacher test accuracy: {test_metrics['accuracy']:.4f}")
 
