@@ -18,7 +18,8 @@ class DistillationLoss(nn.Module):
         self,
         alpha: float = 0.7,
         temperature: float = 4.0,
-        reduction: str = "batchmean"
+        reduction: str = "batchmean",
+        label_smoothing: float = 0.0
     ):
         """
         Initialize distillation loss.
@@ -33,10 +34,14 @@ class DistillationLoss(nn.Module):
         self.alpha = alpha
         self.temperature = temperature
         self.reduction = reduction
+        self.label_smoothing = float(label_smoothing)
         self.class_weights = None
         
         # Loss functions (will be updated with class weights if provided)
-        self.hard_loss = nn.CrossEntropyLoss(reduction="mean")
+        self.hard_loss = nn.CrossEntropyLoss(
+            reduction="mean",
+            label_smoothing=self.label_smoothing
+        )
         self.soft_loss = nn.KLDivLoss(reduction=reduction, log_target=False)
     
     def set_class_weights(self, class_weights: torch.Tensor):
@@ -49,7 +54,8 @@ class DistillationLoss(nn.Module):
         self.class_weights = class_weights
         self.hard_loss = nn.CrossEntropyLoss(
             weight=class_weights, 
-            reduction="mean"
+            reduction="mean",
+            label_smoothing=self.label_smoothing
         )
         print(f"Class weights set for distillation loss: {class_weights.cpu().numpy()}")
     
@@ -102,6 +108,7 @@ class DistillationLoss(nn.Module):
         return {
             'alpha': self.alpha,
             'temperature': self.temperature,
+            'label_smoothing': self.label_smoothing,
             'reduction': self.reduction
         }
 

@@ -18,9 +18,15 @@ model:
 distillation:
   alpha: 0.7  # Weight for hard labels (0-1)
   temperature: 4.0  # Temperature for soft targets
+  label_smoothing: 0.0
 
 # Training Configuration
 training:
+  class_adaptation:
+    enabled: true
+    auto_set_num_classes: true
+    apply_profiles: true
+
   phases:
     phase1:
       epochs: 10
@@ -36,6 +42,7 @@ training:
 
   batch_size: 32
   num_workers: 4
+  label_smoothing: 0.0
   device: "auto"  # auto, cpu, cuda
   performance:
     use_amp: true

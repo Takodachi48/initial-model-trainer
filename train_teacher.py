@@ -28,7 +28,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models import TeacherModel
 from data import create_data_loaders
-from utils import load_config, get_device, clear_gpu_cache
+from utils import load_config, get_device, clear_gpu_cache, adapt_config_for_class_count
 
 
 def maybe_compile_model(model, enabled: bool, mode: str, label: str):
@@ -68,6 +68,13 @@ def parse_args():
     )
     parser.add_argument("--data_only", action="store_true", help="Only test data loading, don't train")
     parser.add_argument("--test_only", action="store_true", help="Only evaluate trained teacher model")
+    parser.add_argument(
+        "--class_profile",
+        type=str,
+        default="auto",
+        choices=["auto", "10", "40", "off"],
+        help="Class adaptation profile: auto-detect, force 10/40, or off",
+    )
     return parser.parse_args()
 
 
@@ -380,7 +387,8 @@ def test_model_only(config):
     model.load_state_dict(checkpoint["teacher_model_state_dict"])
 
     data_loaders, _ = create_data_loaders_from_config(config)
-    criterion = nn.CrossEntropyLoss()
+    label_smoothing = float(config.training.get("label_smoothing", 0.0))
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     eval_loader = data_loaders.get("test") or data_loaders["val"]
     metrics = evaluate(
         model,
@@ -409,6 +417,7 @@ def train_model(config, resume_path=None):
     use_amp = bool(performance_config.get("use_amp", True) and device.type == "cuda")
     amp_dtype = torch.float16 if str(performance_config.get("amp_dtype", "float16")).lower() == "float16" else torch.bfloat16
     channels_last = bool(performance_config.get("channels_last", True) and device.type == "cuda")
+    label_smoothing = float(config.training.get("label_smoothing", 0.0))
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -468,7 +477,7 @@ def train_model(config, resume_path=None):
             resume_loaded = True
             print(f"Resumed from epoch {start_epoch}")
 
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
         phase_epochs = phase_config["epochs"]
         save_every = config.training.get("save_every", 5)
 
@@ -568,6 +577,19 @@ def main():
     config = load_config(args.config)
     if args.override:
         config = apply_config_overrides(config, args.override)
+
+    detected_classes = adapt_config_for_class_count(config, class_profile=args.class_profile)
+    if detected_classes is not None:
+        print(
+            f"Class adaptation active ({args.class_profile}): "
+            f"effective class count {detected_classes} from {config.data.get('train_dir')}"
+        )
+        print(
+            "Using num_classes="
+            f"{config.model.get('teacher', {}).get('num_classes')} "
+            f"(teacher/student synchronized)"
+        )
+
     config.validate()
 
     if args.data_only:

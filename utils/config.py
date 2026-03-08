@@ -164,9 +164,15 @@ def get_default_config() -> Config:
         },
         'distillation': {
             'alpha': 0.7,
-            'temperature': 4.0
+            'temperature': 4.0,
+            'label_smoothing': 0.0
         },
         'training': {
+            'class_adaptation': {
+                'enabled': True,
+                'auto_set_num_classes': True,
+                'apply_profiles': True
+            },
             'phases': {
                 'phase1': {
                     'epochs': 10,
@@ -183,6 +189,7 @@ def get_default_config() -> Config:
             },
             'batch_size': 32,
             'num_workers': 4,
+            'label_smoothing': 0.0,
             'device': 'auto',
             'save_dir': 'checkpoints',
             'save_every': 5,

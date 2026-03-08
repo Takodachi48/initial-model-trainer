@@ -26,7 +26,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from models import StudentModel, TeacherModel, DistillationLoss
 from data import create_data_loaders
 from training import Trainer, Validator
-from utils import load_config, get_device, clear_gpu_cache
+from utils import load_config, get_device, clear_gpu_cache, adapt_config_for_class_count
 
 
 def maybe_compile_model(model, enabled: bool, mode: str, label: str):
@@ -81,6 +81,14 @@ def parse_args():
         "--test_only", 
         action="store_true",
         help="Only run test evaluation, requires trained model"
+    )
+
+    parser.add_argument(
+        "--class_profile",
+        type=str,
+        default="auto",
+        choices=["auto", "10", "40", "off"],
+        help="Class adaptation profile: auto-detect, force 10/40, or off"
     )
     
     return parser.parse_args()
@@ -145,7 +153,8 @@ def create_distillation_loss(config) -> DistillationLoss:
     
     distillation_loss = DistillationLoss(
         alpha=distill_config.get('alpha', 0.7),
-        temperature=distill_config.get('temperature', 4.0)
+        temperature=distill_config.get('temperature', 4.0),
+        label_smoothing=distill_config.get('label_smoothing', 0.0)
     )
     
     print(f"Distillation loss config: {distillation_loss.get_loss_info()}")
@@ -531,6 +540,18 @@ def main():
     # Apply command line overrides
     if args.override:
         config = apply_config_overrides(config, args.override)
+
+    detected_classes = adapt_config_for_class_count(config, class_profile=args.class_profile)
+    if detected_classes is not None:
+        print(
+            f"Class adaptation active ({args.class_profile}): "
+            f"effective class count {detected_classes} from {config.data.get('train_dir')}"
+        )
+        print(
+            "Using num_classes="
+            f"{config.model.get('student', {}).get('num_classes')} "
+            f"(student/teacher synchronized)"
+        )
     
     # Validate configuration
     try:

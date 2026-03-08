@@ -147,3 +147,7 @@ results/
 # OS
 .DS_Store
 Thumbs.db
+
+# sort test script inputs and outputs
+sorting_script/input.txt
+sorting_script/output.txt

@@ -78,3 +78,35 @@ Edit `config/default.yaml` to modify:
 - Data paths
 - Distillation settings (alpha, temperature)
 - Teacher checkpoint path (`model.teacher.checkpoint`) for student distillation
+
+### Automatic 10/40 Class Optimization
+
+`train.py` and `train_teacher.py` now auto-detect class count from `data.train_dir` and:
+- synchronize `model.student.num_classes` and `model.teacher.num_classes`
+- apply tuned profiles for `10` and `40` classes (speed + accuracy defaults)
+
+Control this in `config/default.yaml`:
+```yaml
+training:
+  class_adaptation:
+    enabled: true
+    auto_set_num_classes: true
+    apply_profiles: true
+```
+
+To disable and use fully manual settings, set `training.class_adaptation.enabled: false`.
+
+You can also force profile from CLI:
+```bash
+# Auto detect from train_dir (default)
+python train.py --config config/default.yaml --class_profile auto
+
+# Force 10-class profile
+python train.py --config config/default.yaml --class_profile 10
+
+# Force 40-class profile
+python train.py --config config/default.yaml --class_profile 40
+
+# Disable profile adaptation
+python train.py --config config/default.yaml --class_profile off
+```
