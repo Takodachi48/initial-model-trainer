@@ -136,6 +136,8 @@ for_training/
 !for_training/.gitkeep
 results/
 !results/.gitkeep
+raw_data/
+!raw_data/.gitkeep
 
 # IDE
 .vscode/

@@ -1,10 +1,22 @@
-import torch
-import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
+import json
+import os
 import time
 from contextlib import nullcontext
 from typing import Dict, Tuple
+
+import torch
+import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from sklearn.metrics import ConfusionMatrixDisplay, classification_report, confusion_matrix
+try:
+    import matplotlib
+    if hasattr(matplotlib, "use"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    matplotlib = None
+    plt = None
 
 from models import StudentModel, TeacherModel, DistillationLoss, DistillationMetrics
 
@@ -166,7 +178,11 @@ class Validator:
     def evaluate_model(
         self,
         test_loader,
-        model_name: str = "Student"
+        model_name: str = "Student",
+        class_names: list = None,
+        label_mapping: Dict[str, int] = None,
+        results_dir: str = None,
+        save_confusion_matrix: bool = True
     ) -> Dict[str, float]:
         """
         Final model evaluation on test set.
@@ -187,6 +203,8 @@ class Validator:
         # Additional metrics for detailed evaluation
         class_correct = [0] * self.student_model.num_classes
         class_total = [0] * self.student_model.num_classes
+        y_true = []
+        y_pred = []
         
         hard_loss_fn = nn.CrossEntropyLoss()
         with torch.inference_mode():
@@ -222,6 +240,9 @@ class Validator:
                     label = labels[i]
                     class_correct[label] += c[i].item()
                     class_total[label] += 1
+
+                y_true.extend(labels.detach().cpu().tolist())
+                y_pred.extend(predicted.detach().cpu().tolist())
         
         # Calculate final metrics
         final_metrics = metrics.get_metrics()
@@ -244,6 +265,78 @@ class Validator:
         print(f"Overall Loss: {final_metrics['total_loss']:.4f}")
         print(f"Average Class Accuracy: {final_metrics['avg_class_accuracy']:.4f}")
         print(f"Total Samples: {final_metrics['total_samples']}")
+
+        if results_dir:
+            os.makedirs(results_dir, exist_ok=True)
+
+            def _sanitize_filename(name: str) -> str:
+                return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name.strip())
+
+            def _unique_path(path: str) -> str:
+                if not os.path.exists(path):
+                    return path
+                base, ext = os.path.splitext(path)
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                return f"{base}_{timestamp}{ext}"
+
+            model_tag = _sanitize_filename(model_name) or "model"
+            label_mapping = label_mapping or {}
+            class_names = class_names or []
+
+            num_classes = self.student_model.num_classes
+            labels = list(range(num_classes))
+            display_labels = [str(i) for i in labels]
+            if num_classes <= 30 and len(class_names) == num_classes:
+                display_labels = class_names
+
+            report = classification_report(
+                y_true,
+                y_pred,
+                labels=labels,
+                target_names=class_names if len(class_names) == num_classes else None,
+                output_dict=True,
+                zero_division=0
+            )
+
+            metrics_payload = {
+                "model_name": model_name,
+                "accuracy": final_metrics["accuracy"],
+                "avg_class_accuracy": final_metrics["avg_class_accuracy"],
+                "macro_precision": report.get("macro avg", {}).get("precision", 0.0),
+                "macro_recall": report.get("macro avg", {}).get("recall", 0.0),
+                "macro_f1": report.get("macro avg", {}).get("f1-score", 0.0),
+                "weighted_f1": report.get("weighted avg", {}).get("f1-score", 0.0),
+                "total_samples": final_metrics.get("total_samples", len(y_true)),
+                "class_accuracies": final_metrics["class_accuracies"],
+                "classification_report": report,
+                "class_names": class_names,
+                "label_mapping": label_mapping
+            }
+
+            metrics_path = _unique_path(os.path.join(results_dir, f"{model_tag}_metrics.json"))
+            with open(metrics_path, "w", encoding="utf-8") as f:
+                json.dump(metrics_payload, f, indent=2)
+            print(f"Saved test metrics JSON: {metrics_path}")
+
+            if save_confusion_matrix and plt is not None:
+                cm = confusion_matrix(y_true, y_pred, labels=labels)
+                fig, ax = plt.subplots(figsize=(8, 8))
+                disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
+                disp.plot(
+                    include_values=False if num_classes > 30 else True,
+                    cmap="Blues",
+                    ax=ax,
+                    xticks_rotation=45
+                )
+                ax.set_title(f"{model_name} Confusion Matrix")
+                fig.tight_layout()
+
+                cm_path = _unique_path(os.path.join(results_dir, f"{model_tag}_confusion_matrix.png"))
+                fig.savefig(cm_path, dpi=200)
+                plt.close(fig)
+                print(f"Saved confusion matrix image: {cm_path}")
+            elif save_confusion_matrix and plt is None:
+                print("Matplotlib not available; skipping confusion matrix image output.")
         
         return final_metrics
     

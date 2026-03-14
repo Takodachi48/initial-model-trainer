@@ -97,5 +97,6 @@ data:
 # Logging
 logging:
   log_dir: "logs"
+  results_dir: "results"
   tensorboard: true
   print_every: 50  # Print metrics every N batches

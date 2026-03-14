@@ -10,20 +10,20 @@ CLASS_PROFILES: Dict[int, Dict[str, Any]] = {
             "num_workers": 6,
             "label_smoothing": 0.02,
             "phases": {
-                "phase1": {"epochs": 8, "learning_rate": 0.0012, "weight_decay": 1e-4},
-                "phase2": {"epochs": 6, "learning_rate": 0.0002, "weight_decay": 1e-5},
+                "phase1": {"epochs": 10, "learning_rate": 0.0011, "weight_decay": 1.2e-4},
+                "phase2": {"epochs": 8, "learning_rate": 0.00018, "weight_decay": 1.2e-5},
             },
         },
         "model": {"student": {"unfreeze_last_blocks": 2}},
         "data": {
             "augmentations": {
                 "horizontal_flip": 0.5,
-                "rotation_degrees": 10,
+                "rotation_degrees": 12,
                 "color_jitter": {
-                    "brightness": 0.15,
-                    "contrast": 0.15,
-                    "saturation": 0.15,
-                    "hue": 0.05,
+                    "brightness": 0.18,
+                    "contrast": 0.18,
+                    "saturation": 0.18,
+                    "hue": 0.06,
                 },
             }
         },
@@ -36,20 +36,20 @@ CLASS_PROFILES: Dict[int, Dict[str, Any]] = {
             "label_smoothing": 0.05,
             "class_imbalance": {"use_class_weights": True},
             "phases": {
-                "phase1": {"epochs": 12, "learning_rate": 0.001, "weight_decay": 2e-4},
-                "phase2": {"epochs": 10, "learning_rate": 0.00015, "weight_decay": 5e-5},
+                "phase1": {"epochs": 14, "learning_rate": 0.0009, "weight_decay": 2.5e-4},
+                "phase2": {"epochs": 12, "learning_rate": 0.00012, "weight_decay": 6e-5},
             },
         },
         "model": {"student": {"unfreeze_last_blocks": 3}},
         "data": {
             "augmentations": {
                 "horizontal_flip": 0.5,
-                "rotation_degrees": 15,
+                "rotation_degrees": 16,
                 "color_jitter": {
-                    "brightness": 0.2,
-                    "contrast": 0.2,
-                    "saturation": 0.2,
-                    "hue": 0.08,
+                    "brightness": 0.22,
+                    "contrast": 0.22,
+                    "saturation": 0.22,
+                    "hue": 0.09,
                 },
             }
         },

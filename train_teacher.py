@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -17,6 +18,16 @@ from typing import Dict
 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
+try:
+    import matplotlib
+    if hasattr(matplotlib, "use"):
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception:
+    matplotlib = None
+    plt = None
+
+from sklearn.metrics import ConfusionMatrixDisplay, classification_report, confusion_matrix
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -27,8 +38,14 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models import TeacherModel
-from data import create_data_loaders
-from utils import load_config, get_device, clear_gpu_cache, adapt_config_for_class_count
+from data import create_data_loaders, create_test_loader
+from utils import (
+    load_config,
+    load_label_metadata,
+    get_device,
+    clear_gpu_cache,
+    adapt_config_for_class_count,
+)
 
 
 def maybe_compile_model(model, enabled: bool, mode: str, label: str):
@@ -102,7 +119,7 @@ def apply_config_overrides(config, overrides):
     return config
 
 
-def create_data_loaders_from_config(config, balanced_sampler=None):
+def create_data_loaders_from_config(config, balanced_sampler=None, include_test: bool = True):
     data_config = config.data
     training_config = config.training
     performance_config = training_config.get("performance", {})
@@ -110,7 +127,7 @@ def create_data_loaders_from_config(config, balanced_sampler=None):
     data_loaders, datasets = create_data_loaders(
         train_dir=data_config["train_dir"],
         val_dir=data_config["val_dir"],
-        test_dir=data_config.get("test_dir"),
+        test_dir=data_config.get("test_dir") if include_test else None,
         batch_size=training_config["batch_size"],
         num_workers=training_config.get("num_workers", 4),
         image_size=data_config.get("image_size", 224),
@@ -313,6 +330,121 @@ def evaluate(
     }
 
 
+@torch.no_grad()
+def evaluate_with_artifacts(
+    model,
+    loader,
+    criterion,
+    device,
+    desc: str,
+    results_dir: str,
+    model_name: str,
+    class_names: list = None,
+    label_mapping: Dict[str, int] = None,
+    use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.float16,
+    channels_last: bool = True,
+    save_confusion_matrix: bool = True,
+):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    y_true = []
+    y_pred = []
+
+    for images, labels in tqdm(loader, desc=desc):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        if channels_last and images.dim() == 4:
+            images = images.contiguous(memory_format=torch.channels_last)
+        with _autocast_ctx(use_amp, amp_dtype):
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+        running_loss += loss.item()
+        preds = torch.argmax(logits, dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+        y_true.extend(labels.detach().cpu().tolist())
+        y_pred.extend(preds.detach().cpu().tolist())
+
+    metrics = {
+        "loss": running_loss / max(len(loader), 1),
+        "accuracy": correct / max(total, 1),
+        "total_samples": total,
+    }
+
+    os.makedirs(results_dir, exist_ok=True)
+
+    def _sanitize_filename(name: str) -> str:
+        return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name.strip())
+
+    def _unique_path(path: str) -> str:
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(path)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        return f"{base}_{timestamp}{ext}"
+
+    label_mapping = label_mapping or {}
+    class_names = class_names or []
+    num_classes = model.num_classes
+    labels = list(range(num_classes))
+    display_labels = [str(i) for i in labels]
+    if num_classes <= 30 and len(class_names) == num_classes:
+        display_labels = class_names
+
+    report = classification_report(
+        y_true,
+        y_pred,
+        labels=labels,
+        target_names=class_names if len(class_names) == num_classes else None,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    metrics_payload = {
+        "model_name": model_name,
+        "accuracy": metrics["accuracy"],
+        "macro_precision": report.get("macro avg", {}).get("precision", 0.0),
+        "macro_recall": report.get("macro avg", {}).get("recall", 0.0),
+        "macro_f1": report.get("macro avg", {}).get("f1-score", 0.0),
+        "weighted_f1": report.get("weighted avg", {}).get("f1-score", 0.0),
+        "total_samples": metrics["total_samples"],
+        "classification_report": report,
+        "class_names": class_names,
+        "label_mapping": label_mapping,
+    }
+
+    model_tag = _sanitize_filename(model_name) or "teacher"
+    metrics_path = _unique_path(os.path.join(results_dir, f"{model_tag}_metrics.json"))
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics_payload, f, indent=2)
+    print(f"Saved test metrics JSON: {metrics_path}")
+
+    if save_confusion_matrix and plt is not None:
+        cm = confusion_matrix(y_true, y_pred, labels=labels)
+        fig, ax = plt.subplots(figsize=(8, 8))
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
+        disp.plot(
+            include_values=False if num_classes > 30 else True,
+            cmap="Blues",
+            ax=ax,
+            xticks_rotation=45,
+        )
+        ax.set_title(f"{model_name} Confusion Matrix")
+        fig.tight_layout()
+        cm_path = _unique_path(os.path.join(results_dir, f"{model_tag}_confusion_matrix.png"))
+        fig.savefig(cm_path, dpi=200)
+        plt.close(fig)
+        print(f"Saved confusion matrix image: {cm_path}")
+    elif save_confusion_matrix and plt is None:
+        print("Matplotlib not available; skipping confusion matrix image output.")
+
+    return metrics
+
+
 def save_checkpoint(
     save_dir,
     model,
@@ -386,19 +518,45 @@ def test_model_only(config):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["teacher_model_state_dict"])
 
-    data_loaders, _ = create_data_loaders_from_config(config)
+    label_mapping, class_names, _ = load_label_metadata(checkpoint_path, map_location=device)
+    results_dir = config.logging.get("results_dir", "results")
+
+    test_dir = config.data.get("test_dir")
+    if test_dir:
+        test_loader, _ = create_test_loader(
+            test_dir=test_dir,
+            batch_size=config.training["batch_size"],
+            num_workers=config.training.get("num_workers", 4),
+            image_size=config.data.get("image_size", 224),
+            normalize_mean=config.data.get("normalize", {}).get("mean"),
+            normalize_std=config.data.get("normalize", {}).get("std"),
+            pin_memory=performance_config.get("pin_memory", True),
+            persistent_workers=performance_config.get("persistent_workers"),
+            prefetch_factor=performance_config.get("prefetch_factor"),
+        )
+        eval_loader = test_loader
+        eval_desc = "Teacher Evaluation (Test)"
+    else:
+        data_loaders, _ = create_data_loaders_from_config(config, include_test=False)
+        eval_loader = data_loaders["val"]
+        eval_desc = "Teacher Evaluation (Val)"
+
     label_smoothing = float(config.training.get("label_smoothing", 0.0))
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    eval_loader = data_loaders.get("test") or data_loaders["val"]
-    metrics = evaluate(
-        model,
-        eval_loader,
-        criterion,
-        device,
-        "Teacher Evaluation",
+    metrics = evaluate_with_artifacts(
+        model=model,
+        loader=eval_loader,
+        criterion=criterion,
+        device=device,
+        desc=eval_desc,
+        results_dir=results_dir,
+        model_name="Best Teacher Model",
+        class_names=class_names,
+        label_mapping=label_mapping,
         use_amp=use_amp,
         amp_dtype=amp_dtype,
         channels_last=channels_last,
+        save_confusion_matrix=True,
     )
     print(f"Teacher accuracy: {metrics['accuracy']:.4f}, loss: {metrics['loss']:.4f}")
 
@@ -435,10 +593,14 @@ def train_model(config, resume_path=None):
     use_class_weights = class_imbalance.get("use_class_weights", False)
     use_balanced_sampler = class_imbalance.get("use_balanced_sampler", False)
 
-    data_loaders, datasets = create_data_loaders_from_config(config)
+    data_loaders, datasets = create_data_loaders_from_config(config, include_test=False)
     if use_balanced_sampler:
         sampler = create_balanced_sampler(datasets["train"])
-        data_loaders, datasets = create_data_loaders_from_config(config, balanced_sampler=sampler)
+        data_loaders, datasets = create_data_loaders_from_config(
+            config,
+            balanced_sampler=sampler,
+            include_test=False,
+        )
     label_mapping, class_names, _ = extract_label_metadata(datasets["train"])
 
     class_weights = create_class_weights(datasets["train"], device) if use_class_weights else None
@@ -548,21 +710,39 @@ def train_model(config, resume_path=None):
 
         start_epoch += phase_epochs
 
-    if "test" in data_loaders:
+    test_dir = config.data.get("test_dir")
+    if test_dir:
         best_path = os.path.join(save_dir, "best_teacher_model.pth")
         if os.path.exists(best_path):
             checkpoint = torch.load(best_path, map_location=device)
             model.load_state_dict(checkpoint["teacher_model_state_dict"])
 
-        test_metrics = evaluate(
+        results_dir = config.logging.get("results_dir", "results")
+        test_loader, _ = create_test_loader(
+            test_dir=test_dir,
+            batch_size=config.training["batch_size"],
+            num_workers=config.training.get("num_workers", 4),
+            image_size=config.data.get("image_size", 224),
+            normalize_mean=config.data.get("normalize", {}).get("mean"),
+            normalize_std=config.data.get("normalize", {}).get("std"),
+            pin_memory=performance_config.get("pin_memory", True),
+            persistent_workers=performance_config.get("persistent_workers"),
+            prefetch_factor=performance_config.get("prefetch_factor"),
+        )
+        test_metrics = evaluate_with_artifacts(
             model=model,
-            loader=data_loaders["test"],
+            loader=test_loader,
             criterion=nn.CrossEntropyLoss(),
             device=device,
             desc="Teacher Final Test",
+            results_dir=results_dir,
+            model_name="Best Teacher Model",
+            class_names=class_names,
+            label_mapping=label_mapping,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
             channels_last=channels_last,
+            save_confusion_matrix=True,
         )
         print(f"Final teacher test accuracy: {test_metrics['accuracy']:.4f}")
 

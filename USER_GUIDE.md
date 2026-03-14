@@ -57,6 +57,9 @@ data:
   val_dir: "for_training/default/val"      # If using split script
   test_dir: "for_training/default/test"    # If using split script
   # Or use "your_data/train", "your_data/val", "your_data/test" for manual setup
+
+logging:
+  results_dir: "results"  # Evaluation artifacts (confusion matrix + metrics JSON)
 ```
 
 ### 4. Run Training (in order)
@@ -76,6 +79,8 @@ python train_teacher.py --config config/default.yaml --test_only
 # Test student
 python train.py --config config/default.yaml --test_only
 ```
+
+Test outputs (confusion matrix PNG + metrics JSON) are saved in `results/` by default.
 
 ---
 
@@ -131,6 +136,9 @@ data:
   train_dir: "your_data/train"
   val_dir: "your_data/val"
   test_dir: "your_data/test"
+
+logging:
+  results_dir: "results"
 ```
 
 ### 4. Start Training
@@ -357,6 +365,7 @@ cp *.jpg ../test/ # Same files! (WRONG!)
 ```
 # Split systematically ensuring no overlap
 python split_dataset.py --input raw_data --output-root for_training --dataset-name default
+# Test images are routed to: for_training/default/test
 ```
 
 ### Naming Conventions
@@ -450,6 +459,18 @@ training:
   device: "auto"  # auto, cpu, cuda
 ```
 
+#### Class Profile Shortcuts (10 or 40 classes)
+```bash
+# Auto-detect class count (default)
+python train.py --config config/default.yaml --class_profile auto
+
+# Force 10-class tuning
+python train.py --config config/default.yaml --class_profile 10
+
+# Force 40-class tuning
+python train.py --config config/default.yaml --class_profile 40
+```
+
 #### Class Imbalance Handling
 ```yaml
 training:
@@ -521,6 +542,9 @@ python train.py --config config/default.yaml \
     --override model.student.num_classes 5
 ```
 
+#### Note on Testing
+Student and teacher training defer test loading until after training completes. The final test run loads the best checkpoint and writes evaluation artifacts to `results/`.
+
 ### Monitoring Training
 
 #### TensorBoard
@@ -583,6 +607,7 @@ Class weights: [2.60, 0.72, 0.81]
 - **Overall Accuracy**: Total correct predictions
 - **Class Accuracy**: Per-class performance
 - **Average Class Accuracy**: Mean of all class accuracies
+- **Macro/Weighted F1**: Saved in metrics JSON
 
 #### Loss Metrics
 - **Training Loss**: Model learning progress
@@ -596,7 +621,7 @@ Class weights: [2.60, 0.72, 0.81]
 
 ### Evaluation Commands
 
-#### Test on Validation Set
+#### Test on Test Set (or Val if no test)
 ```bash
 python train.py --config config/default.yaml --test_only
 ```
@@ -613,6 +638,16 @@ import torch
 checkpoint = torch.load('checkpoints/best_student_model.pth')
 print(checkpoint['metrics'])
 ```
+
+#### Confusion Matrix + Metrics Artifacts
+After test evaluation, the following files are written to `results/`:
+```
+results/
+├── Best_Student_Model_confusion_matrix.png
+└── Best_Student_Model_metrics.json
+```
+
+The JSON includes macro/weighted F1 scores, per-class metrics, and class label mapping (if available).
 
 #### Per-Class Analysis
 The evaluation shows per-class accuracy to identify:

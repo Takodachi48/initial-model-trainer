@@ -1,5 +1,6 @@
 """
 Split class-folder images into train/val/test directories with an 80/10/10 ratio.
+Test images are always routed into the output test folder for downstream evaluation.
 
 Expected input structure:
 input_dir/
@@ -91,6 +92,7 @@ def split_and_move(input_dir: Path, output_root: Path, dataset_name: str, seed: 
         )
 
     print(f"\nDone. Moved {moved_total} image(s) into: {output_base}")
+    print("Test split routed to: " + str(output_base / "test"))
 
 
 def parse_args() -> argparse.Namespace:

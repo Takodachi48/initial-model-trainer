@@ -24,9 +24,9 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models import StudentModel, TeacherModel, DistillationLoss
-from data import create_data_loaders
+from data import create_data_loaders, create_test_loader
 from training import Trainer, Validator
-from utils import load_config, get_device, clear_gpu_cache, adapt_config_for_class_count
+from utils import load_config, get_device, clear_gpu_cache, adapt_config_for_class_count, load_label_metadata
 
 
 def maybe_compile_model(model, enabled: bool, mode: str, label: str):
@@ -162,7 +162,7 @@ def create_distillation_loss(config) -> DistillationLoss:
     return distillation_loss
 
 
-def create_data_loaders_from_config(config):
+def create_data_loaders_from_config(config, include_test: bool = True):
     """Create data loaders from configuration."""
     print("Creating data loaders...")
     
@@ -174,7 +174,7 @@ def create_data_loaders_from_config(config):
     data_loaders, datasets = create_data_loaders(
         train_dir=data_config['train_dir'],
         val_dir=data_config['val_dir'],
-        test_dir=data_config.get('test_dir'),
+        test_dir=data_config.get('test_dir') if include_test else None,
         batch_size=training_config['batch_size'],
         num_workers=training_config.get('num_workers', 4),
         image_size=data_config.get('image_size', 224),
@@ -265,8 +265,8 @@ def train_model(config, resume_path=None):
     # Create distillation loss
     distillation_loss = create_distillation_loss(config)
     
-    # Create data loaders
-    data_loaders, datasets = create_data_loaders_from_config(config)
+    # Create data loaders (train/val only during training)
+    data_loaders, datasets = create_data_loaders_from_config(config, include_test=False)
     
     # Create trainer and validator
     class_imbalance_config = config.training.get('class_imbalance', {})
@@ -298,7 +298,7 @@ def train_model(config, resume_path=None):
             data_loaders, _ = create_data_loaders(
                 train_dir=config.data['train_dir'],
                 val_dir=config.data['val_dir'],
-                test_dir=config.data.get('test_dir'),
+                test_dir=None,
                 batch_size=config.training['batch_size'],
                 num_workers=config.training.get('num_workers', 4),
                 image_size=config.data.get('image_size', 224),
@@ -414,7 +414,8 @@ def train_model(config, resume_path=None):
         start_epoch = start_epoch + phase_epochs
     
     # Final evaluation on test set if available
-    if 'test' in data_loaders:
+    test_dir = config.data.get('test_dir')
+    if test_dir:
         print(f"\n{'='*50}")
         print("FINAL TEST EVALUATION")
         print(f"{'='*50}")
@@ -424,9 +425,28 @@ def train_model(config, resume_path=None):
         if os.path.exists(best_model_path):
             trainer.load_checkpoint(best_model_path)
         
+        results_dir = config.logging.get('results_dir', 'results')
+        os.makedirs(results_dir, exist_ok=True)
+
+        test_loader, _ = create_test_loader(
+            test_dir=test_dir,
+            batch_size=config.training['batch_size'],
+            num_workers=config.training.get('num_workers', 4),
+            image_size=config.data.get('image_size', 224),
+            normalize_mean=config.data.get('normalize', {}).get('mean'),
+            normalize_std=config.data.get('normalize', {}).get('std'),
+            pin_memory=performance_config.get('pin_memory', True),
+            persistent_workers=performance_config.get('persistent_workers'),
+            prefetch_factor=performance_config.get('prefetch_factor'),
+        )
+
         test_metrics = validator.evaluate_model(
-            test_loader=data_loaders['test'],
-            model_name="Best Student Model"
+            test_loader=test_loader,
+            model_name="Best Student Model",
+            class_names=trainer.class_names,
+            label_mapping=trainer.label_mapping,
+            results_dir=results_dir,
+            save_confusion_matrix=True
         )
         
         # Generate inference statistics
@@ -495,9 +515,26 @@ def test_model_only(config):
     
     checkpoint = torch.load(checkpoint_path, map_location=device)
     student_model.load_state_dict(checkpoint['student_model_state_dict'])
+    label_mapping, class_names, _ = load_label_metadata(checkpoint_path, map_location=device)
     
     # Create data loaders
-    data_loaders, datasets = create_data_loaders_from_config(config)
+    performance_config = config.training.get('performance', {})
+    test_dir = config.data.get('test_dir')
+    if test_dir:
+        test_loader, _ = create_test_loader(
+            test_dir=test_dir,
+            batch_size=config.training['batch_size'],
+            num_workers=config.training.get('num_workers', 4),
+            image_size=config.data.get('image_size', 224),
+            normalize_mean=config.data.get('normalize', {}).get('mean'),
+            normalize_std=config.data.get('normalize', {}).get('std'),
+            pin_memory=performance_config.get('pin_memory', True),
+            persistent_workers=performance_config.get('persistent_workers'),
+            prefetch_factor=performance_config.get('prefetch_factor'),
+        )
+        data_loaders = {'test': test_loader}
+    else:
+        data_loaders, _ = create_data_loaders_from_config(config, include_test=False)
     
     # Create validator
     distillation_loss = create_distillation_loss(config)
@@ -512,15 +549,26 @@ def test_model_only(config):
     )
     
     # Run evaluation
+    results_dir = config.logging.get('results_dir', 'results')
+    os.makedirs(results_dir, exist_ok=True)
+
     if 'test' in data_loaders:
         test_metrics = validator.evaluate_model(
             test_loader=data_loaders['test'],
-            model_name="Loaded Student Model"
+            model_name="Loaded Student Model",
+            class_names=class_names,
+            label_mapping=label_mapping,
+            results_dir=results_dir,
+            save_confusion_matrix=True
         )
     else:
         val_metrics = validator.evaluate_model(
             test_loader=data_loaders['val'],
-            model_name="Loaded Student Model"
+            model_name="Loaded Student Model",
+            class_names=class_names,
+            label_mapping=label_mapping,
+            results_dir=results_dir,
+            save_confusion_matrix=True
         )
     
     print("Model testing completed!")
